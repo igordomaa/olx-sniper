@@ -1,9 +1,10 @@
 import streamlit as st
-import requests
+import cloudscraper
 import json
 import sqlite3
 import statistics
 import time
+import re
 from openai import OpenAI
 
 # --- 1. BAZA PODATAKA ---
@@ -13,45 +14,83 @@ c.execute('''CREATE TABLE IF NOT EXISTS seen_ads
              (id INTEGER PRIMARY KEY, title TEXT, price REAL, market_price REAL, profit REAL, url TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 conn.commit()
 
-# --- 2. OLX.BA API + KEŠIRANJE TRŽIŠNIH CIJENA ---
+# Kreiramo CloudScraper koji imitira pravi Chrome browser
+scraper = cloudscraper.create_scraper(
+    browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
+)
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json"
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "bs-BA,bs;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://olx.ba/",
+    "Origin": "https://olx.ba"
 }
 
-# Riječi koje odmah ignorišemo BEZ trošenja AI limita!
 BANNED_WORDS = ["kutija", "prazna", "neispravno", "neispravan", "dijelovi", "otkup", "kupujem", "iznajmljujem", "najam", "naljepnica", "skin", "kabal", "popravka", "servis"]
 
-def fetch_latest_olx_ads(query, limit=10):
-    url = "https://api.olx.ba/search"
-    params = {"q": query, "sort_by": "date", "sort_order": "desc", "per_page": limit}
-    try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        if r.status_code == 200:
-            return r.json().get("data", [])
-    except Exception as e:
-        st.error(f"Greška pri konekciji na OLX: {e}")
-    return []
+# --- 2. PAMETNO POVLAČENJE OGLASA SA OLX.BA ---
+def parse_olx_price(ad):
+    """Izvlači brojčanu cijenu bez obzira u kojem je formatu OLX vrati"""
+    p = ad.get("price")
+    if isinstance(p, (int, float)):
+        return float(p)
+    if isinstance(p, str):
+        clean = re.sub(r'[^\d.]', '', p.replace('.', '').replace(',', '.'))
+        try:
+            return float(clean)
+        except:
+            pass
+    # Provjera display_price polja ako postoji
+    dp = ad.get("display_price", "")
+    if dp and isinstance(dp, str):
+        nums = re.findall(r'\d+', dp.replace('.', ''))
+        if nums:
+            return float(nums[0])
+    return 0.0
 
-@st.cache_data(ttl=3600) # Pamti prosječnu cijenu 1 sat da ne opterećuje OLX
+def fetch_latest_olx_ads(query, limit=10):
+    # Pokušaj 1: Novi OLX API
+    urls_to_try = [
+        f"https://api.olx.ba/search?q={query}&sort_by=date&sort_order=desc&per_page={limit}",
+        f"https://olx.ba/api/search?q={query}&sort_by=date&sort_order=desc&per_page={limit}"
+    ]
+    
+    for url in urls_to_try:
+        try:
+            # Pokušavamo sa curl_cffi ako je dostupan (najjači za Cloudflare)
+            try:
+                from curl_cffi import requests as cf_requests
+                r = cf_requests.get(url, headers=HEADERS, impersonate="chrome120", timeout=12)
+            except ImportError:
+                r = scraper.get(url, headers=HEADERS, timeout=12)
+                
+            if r.status_code == 200:
+                data = r.json()
+                ads = data.get("data", []) or data.get("listings", []) or data.get("results", [])
+                if ads:
+                    return ads, "OK"
+        except Exception as e:
+            last_err = str(e)
+            
+    return [], f"OLX API blokira zahtjev sa ovog servera (Status: {r.status_code if 'r' in locals() else 'Err'})."
+
+@st.cache_data(ttl=3600)
 def get_market_median_price(standardized_name):
-    url = "https://api.olx.ba/search"
-    params = {"q": standardized_name, "per_page": 30}
-    try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        if r.status_code == 200:
-            ads = r.json().get("data", [])
-            prices = [float(ad.get("price", 0)) for ad in ads if isinstance(ad.get("price"), (int, float)) and ad.get("price", 0) > 50]
-            if len(prices) >= 3:
-                prices.sort()
-                cut = max(1, int(len(prices) * 0.15))
-                filtered = prices[cut:-cut] if len(prices) > 5 else prices
-                return round(statistics.median(filtered), -1)
-    except Exception:
-        pass
+    ads, status = fetch_latest_olx_ads(standardized_name, limit=25)
+    if ads:
+        prices = []
+        for ad in ads:
+            p = parse_olx_price(ad)
+            if p > 50:
+                prices.append(p)
+        if len(prices) >= 3:
+            prices.sort()
+            cut = max(1, int(len(prices) * 0.15))
+            filtered = prices[cut:-cut] if len(prices) > 5 else prices
+            return round(statistics.median(filtered), -1)
     return 0
 
-# --- 3. GROQ AI ANALIZA (Sa automatskim Retry mehanizmom) ---
+# --- 3. GROQ AI ANALIZA ---
 def analyze_with_groq(client, title, listed_price):
     prompt = f"""
     Analiziraj ovaj OLX.ba oglas:
@@ -59,8 +98,8 @@ def analyze_with_groq(client, title, listed_price):
     Cijena: {listed_price} KM
 
     Zadatak:
-    1. Ako je oglas samo za dodatnu opremu (džojstik, igrica, kuler, kućište bez komponenti) ili uslugu, postavi "is_valid_hardware" na false. Samo kompletne konzole, grafičke kartice, procesori, laptopi i PC su true.
-    2. Napiši čist, kratak naziv modela za pretragu cijene (npr. "PlayStation 5", "RTX 3060", "RX 6600 XT", "Ryzen 5 5600").
+    1. Ako je oglas samo za dodatnu opremu (džojstik, igrica, kuler, prazno kućište) ili uslugu, postavi "is_valid_hardware" na false. Samo kompletne konzole, grafičke kartice, procesori, laptopi i PC su true.
+    2. Napiši čist, kratak naziv modela za pretragu cijene (npr. "PlayStation 5", "RTX 3060", "RX 6600", "Ryzen 5 5600").
 
     Vrati isključivo JSON:
     {{
@@ -68,7 +107,6 @@ def analyze_with_groq(client, title, listed_price):
         "standardized_name": "string"
     }}
     """
-    # Ako slučajno udari u Rate Limit, sačekaće i probati ponovo automatski
     for attempt in range(3):
         try:
             res = client.chat.completions.create(
@@ -80,7 +118,7 @@ def analyze_with_groq(client, title, listed_price):
             return json.loads(res.choices[0].message.content)
         except Exception as e:
             if "429" in str(e) or "rate_limit" in str(e).lower():
-                time.sleep(6) # Čeka 6 sekundi ako se desi rate limit
+                time.sleep(6)
             else:
                 return None
     return None
@@ -92,14 +130,14 @@ def send_telegram_alert(bot_token, chat_id, message):
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=5)
+        scraper.post(url, json=payload, timeout=5)
     except Exception:
         pass
 
 # --- 5. WEB SAJT (STREAMLIT DASHBOARD) ---
 st.set_page_config(page_title="OLX.ba AI Sniper", page_icon="⚡", layout="wide")
 st.title("⚡ OLX.ba AI Arbitrage Sniper (Groq No-Limit Edition)")
-st.markdown("Koristi **Groq (Llama 3.3 70B)** + Python pred-filtere tako da **nikad ne udara u Rate Limit**.")
+st.markdown("Koristi **Groq (Llama 3.3 70B)** + Anti-Cloudflare zaštitu za direktno skeniranje OLX.ba.")
 
 with st.sidebar:
     st.header("⚙️ Konfiguracija")
@@ -109,45 +147,58 @@ with st.sidebar:
     
     st.divider()
     search_terms = st.text_area("Šta skeniramo? (odvojeno zarezom)", "ps5, playstation 5, rtx 3060, rtx 3070, rx 6600")
-    min_profit = st.slider("Minimalni profit za alarm (KM)", 30, 300, 80, step=10)
+    min_profit = st.slider("Minimalni profit za alarm (KM)", 30, 300, 30, step=10)
     auto_loop = st.checkbox("🔄 Automatski skeniraj svakih 3 minute")
+    
+    st.divider()
+    if st.button("🗑️ Očisti bazu pregledanih oglasa"):
+        c.execute("DELETE FROM seen_ads")
+        conn.commit()
+        st.success("Baza očišćena! Klikni na Pokreni Skeniranje.")
 
 if st.button("🚀 Pokreni Skeniranje Sada", type="primary") or auto_loop:
     if not groq_key:
-        st.warning("⚠️ Unesi besplatni Groq API ključ lijevo (uzmi ga na console.groq.com/keys)!")
+        st.warning("⚠️ Unesi besplatni Groq API ključ lijevo!")
     else:
-        # Povezujemo OpenAI klijent na besplatni Groq server
         client = OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1")
         queries = [q.strip() for q in search_terms.split(",") if q.strip()]
+        
         status_box = st.empty()
+        log_expander = st.expander("🕵️‍♂️ Pogledaj detaljan rad skenera uživo (Debug Log)", expanded=True)
         
         for q in queries:
             status_box.info(f"🔍 Skeniram OLX.ba za: **{q}**...")
-            ads = fetch_latest_olx_ads(q, limit=10)
+            ads, api_status = fetch_latest_olx_ads(q, limit=8)
+            
+            if not ads:
+                log_expander.error(f"❌ Za '{q}' nije vraćen nijedan oglas. Razlog: {api_status}")
+                continue
+            else:
+                log_expander.write(f"✅ Pronađeno **{len(ads)}** oglasa na OLX-u za `{q}`. Analiziram cijene...")
             
             for ad in ads:
                 ad_id = ad.get("id")
-                title = ad.get("title", "")
-                raw_price = ad.get("price", 0) or 0
+                title = ad.get("title", "Nepoznat naslov")
+                raw_price = parse_olx_price(ad)
                 ad_url = f"https://olx.ba/artikal/{ad_id}"
                 
-                # 1. Provjeri da li je već u bazi (0 AI poziva)
                 c.execute("SELECT id FROM seen_ads WHERE id=?", (ad_id,))
                 if c.fetchone():
+                    log_expander.caption(f"⏭️ Preskačem (već u bazi): {title}")
                     continue
                 
-                # 2. PYTHON PRED-FILTER: Ignoriši "Po dogovoru" (<= 45 KM) i zabranjene riječi BEZ trošenja AI-ja!
                 title_lower = title.lower()
                 if raw_price <= 45 or any(bad_word in title_lower for bad_word in BANNED_WORDS):
+                    log_expander.caption(f"🚫 Ignorišem (Cijena {raw_price} KM ili zabranjena riječ): {title}")
                     c.execute("INSERT INTO seen_ads (id, title, price, market_price, profit, url) VALUES (?, ?, ?, 0, 0, ?)", (ad_id, title, raw_price, ad_url))
                     conn.commit()
                     continue
                 
-                # 3. Tek ako oglas ima pravu cijenu i nije smeće, šaljemo ga na Groq AI
                 ai_data = analyze_with_groq(client, title, raw_price)
-                time.sleep(2.2) # Garantuje max ~27 zahtjeva u minuti (ispod Groq limita od 30/min)
+                time.sleep(2.0)
                 
                 if not ai_data or not ai_data.get("is_valid_hardware"):
+                    log_expander.caption(f"🤖 AI odbacio (dodatna oprema/igrica): {title}")
                     c.execute("INSERT INTO seen_ads (id, title, price, market_price, profit, url) VALUES (?, ?, ?, 0, 0, ?)", (ad_id, title, raw_price, ad_url))
                     conn.commit()
                     continue
@@ -158,6 +209,8 @@ if st.button("🚀 Pokreni Skeniranje Sada", type="primary") or auto_loop:
                 if market_price > 0:
                     fast_sell_price = round(market_price * 0.90, -1)
                     profit = fast_sell_price - raw_price
+                    
+                    log_expander.success(f"💎 Obrađen: **{title}** | Cijena: {raw_price} KM | Tržišna: {market_price} KM | Profit: {profit} KM")
                     
                     c.execute("INSERT INTO seen_ads (id, title, price, market_price, profit, url) VALUES (?, ?, ?, ?, ?, ?)", 
                               (ad_id, f"[{std_name}] {title}", raw_price, market_price, profit, ad_url))
@@ -176,7 +229,7 @@ if st.button("🚀 Pokreni Skeniranje Sada", type="primary") or auto_loop:
                         send_telegram_alert(tg_token, tg_chat_id, msg)
                         st.toast(f"🔥 Pronađen deal! Profit: +{profit} KM", icon="💰")
                         
-        status_box.success("✅ Skeniranje završeno bez grešaka!")
+        status_box.success("✅ Skeniranje završeno!")
 
 # --- 6. PRIKAZ REZULTATA NA SAJTU ---
 st.subheader("📊 Pronađeni oglasi i kalkulacija zarade")
